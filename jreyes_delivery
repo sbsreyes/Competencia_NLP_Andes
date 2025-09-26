@@ -1,0 +1,161 @@
+
+# NLP Decades Classification — Classic ML Pipeline (scikit-learn)
+
+**Reglas cumplidas:** Sin deep learning / transformers. Solo scikit‑learn + TF‑IDF (palabras y caracteres).  
+**Objetivo:** Predecir la **década** (tres primeros dígitos del año) de un texto.
+
+---
+
+## 1. Setup y Configuración
+
+- Reproducibilidad con `random_state` fijo.
+- `FAST_RUN`: usa 3 folds (rápido) para desarrollo local; ponlo en `False` para 5 folds antes de enviar el modelo final.
+
+
+
+import os, re, json, math, warnings, sys, platform, joblib
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import StratifiedKFold, train_test_split, GridSearchCV
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.pipeline import FeatureUnion, Pipeline
+from sklearn.svm import LinearSVC
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+
+RANDOM_STATE = 77
+FAST_RUN = True  # Cambia a False para 5-fold CV y una búsqueda más exhaustiva
+print("Python:", sys.version)
+print("OS:", platform.platform())
+
+
+train_path = "/Users/sebastian/Documents/train.csv"
+eval_path  = "/Users/sebastian/Documents/eval.csv"
+
+train_df = pd.read_csv(train_path)
+eval_df  = pd.read_csv(eval_path)
+
+assert {"text","decade"} <= set(train_df.columns), "train.csv debe incluir columnas: text, decade"
+assert {"id","text"} <= set(eval_df.columns), "eval.csv debe incluir columnas: id, text"
+
+print("Train shape:", train_df.shape, "| Eval shape:", eval_df.shape)
+train_df.head()
+
+
+
+import re
+
+def light_clean(s: str) -> str:
+    if pd.isna(s): return ""
+    s = str(s)
+    s = s.replace("\r", " ").replace("\n"," ").lower()
+    s = re.sub(r"[\x00-\x1f\x7f]", " ", s)           # control chars
+    s = re.sub(r"[^0-9a-záéíóúüñ ]", " ", s)         # keep spanish letters + digits + space
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+train_df["text_clean"] = train_df["text"].map(light_clean)
+eval_df["text_clean"]  = eval_df["text"].map(light_clean)
+
+train_df[["text","text_clean","decade"]].head(3)
+
+
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.pipeline import FeatureUnion
+
+word_vectorizer = TfidfVectorizer(
+    analyzer="word",
+    ngram_range=(1,2),
+    min_df=2,
+    max_df=0.95,
+    max_features=150_000,
+    sublinear_tf=True,
+    lowercase=False,
+    norm="l2"
+)
+
+char_vectorizer = TfidfVectorizer(
+    analyzer="char",
+    ngram_range=(3,5),
+    min_df=2,
+    max_df=0.98,
+    max_features=250_000,
+    sublinear_tf=True,
+    lowercase=False,
+    norm="l2"
+)
+
+features = FeatureUnion([
+    ("word_tfidf", word_vectorizer),
+    ("char_tfidf", char_vectorizer),
+])
+
+X = train_df["text_clean"].values
+y = train_df["decade"].values
+
+
+
+X_tr, X_va, y_tr, y_va = train_test_split(X, y, test_size=0.15, random_state=RANDOM_STATE, stratify=y)
+
+cv = StratifiedKFold(n_splits=(3 if FAST_RUN else 5), shuffle=True, random_state=RANDOM_STATE)
+
+pipe = Pipeline([
+    ("features", features),
+    ("clf", LinearSVC())  # placeholder; se sobreescribe en la grilla
+])
+
+param_grid = [
+    # LinearSVC
+    {
+        "clf": [LinearSVC()],
+        "clf__C": [0.25, 0.5, 1.0, 2.0, 4.0] if not FAST_RUN else [0.5, 1.0, 2.0],
+    },
+    # Logistic Regression (multinomial)
+    {
+        "clf": [LogisticRegression(solver="saga", penalty="l2", max_iter=4000, n_jobs=-1, multi_class="auto")],
+        "clf__C": [0.5, 1.0, 2.0] if FAST_RUN else [0.25, 0.5, 1.0, 2.0, 4.0],
+        "clf__class_weight": [None, "balanced"],
+    }
+]
+
+grid = GridSearchCV(
+    estimator=pipe,
+    param_grid=param_grid,
+    scoring="accuracy",
+    cv=cv,
+    n_jobs=-1,
+    verbose=1
+)
+
+grid.fit(X_tr, y_tr)
+
+print("Best CV Accuracy:", grid.best_score_)
+print("Best Params:", grid.best_params_)
+
+best_model = grid.best_estimator_
+pred_va = best_model.predict(X_va)
+va_acc = accuracy_score(y_va, pred_va)
+print("Holdout Accuracy:", va_acc)
+
+
+
+# Reentrenar en TODO el train
+best_model.fit(X, y)
+
+# Predecir eval
+eval_pred = best_model.predict(eval_df["text_clean"].values)
+
+# Guardar submission
+submission = pd.DataFrame({"id": eval_df["id"].values, "answer": eval_pred})
+sub_path = "submission.csv"
+submission.to_csv(sub_path, index=False)
+print("Saved:", sub_path)
+
+# Serializar modelo
+model_path = "model.joblib"
+joblib.dump(best_model, model_path)
+print("Saved:", model_path)
